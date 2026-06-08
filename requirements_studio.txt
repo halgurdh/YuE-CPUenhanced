@@ -1,0 +1,15 @@
+# YuE Studio — Python dependencies
+# pip install -r requirements_studio.txt
+
+rich>=13.0.0
+gradio>=4.0.0
+
+# Audio stitching for multi-section songs (intro/verse/chorus/outro).
+# Uses ffmpeg under the hood — make sure ffmpeg is on PATH.
+pydub>=0.25.1
+
+# Optional: AI lyrics generation
+# anthropic>=0.40.0
+
+# Optional: stem separation (used by stem_splitter.py)
+audio-separator>=0.17.0

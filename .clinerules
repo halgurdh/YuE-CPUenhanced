@@ -1,0 +1,39 @@
+# Cline System Rules & Workspace Standards
+
+## 0. Model Configuration (Qwen2.5 Coder 7B — Local LM Studio)
+- **Max Context Window:** 16,384 tokens total
+- **Reserve for Output:** Always reserve 1,064 tokens for response generation
+- **Usable Input Budget:** 14,720 tokens maximum per request
+- **KV Cache Limit:** Never exceed 16K context — beyond this spills to RAM and stalls
+- **Token Awareness:** If accumulated context (files + history + prompt) approaches 14K, 
+  summarize or drop earlier conversation turns before proceeding
+- **No Context Padding:** Never include unnecessary file contents, logs, or stack traces 
+  in full. Truncate to the relevant lines only.
+
+## 1. Operational Guardrails (Token & Cost Control)
+- **Strict Context Locking:** Never read, edit, or search files outside the directory 
+  explicitly mentioned in the prompt unless a dependency error absolutely requires it.
+- **Diffs Over Total Rewrites:** When updating existing code, modify only the specific 
+  target functions or lines. Do not regenerate the entire file if a partial edit is possible.
+- **Loop Prevention Rule:** If a command execution, build, or test fails 3 times 
+  consecutively with the same error, STOP immediately. Present the error block to the 
+  user and ask for strategic guidance.
+
+## 2. Architecture & Code Quality Standards
+- **Modular Design:** Prioritize small, isolated, and single-purpose files. Extract shared 
+  utility functions into explicit helper modules rather than writing massive inline scripts.
+- **Type Safety First:** Always write strict TypeScript definitions. Avoid using `any` at 
+  all costs. Ensure interfaces match existing architecture specs.
+- **No Floating Promises:** All asynchronous operations must use explicit `try/catch` 
+  handling and log contextual errors.
+
+## 3. Terminal & Verification Workflows
+- **Autonomous Validation:** After making changes to operational code, you must execute 
+  the local test or lint command (e.g., `npm run test` or standard linter) to verify integrity.
+- **No Silent Completions:** Do not declare a task "complete" based solely on writing the 
+  code. It is only complete when the file compiles successfully and relevant tests pass green.
+
+## 4. Communication Protocol
+- **Be Concise:** When responding or explaining changes, skip pleasantries and generic 
+  fluff. Lead with the direct outcome, summarize the technical edits, and highlight any 
+  potential risks to dependencies.
