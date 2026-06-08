@@ -69,6 +69,15 @@ MODELS = {
     "icl_zh":    "m-a-p/YuE-s1-7B-anneal-zh-icl",
     "cot_jpkr":  "m-a-p/YuE-s1-7B-anneal-jp-kr-cot",
     "icl_jpkr":  "m-a-p/YuE-s1-7B-anneal-jp-kr-icl",
+
+    # ACE-Step 1.5 aliases (fallback-safe to current YuE models until explicit IDs are provided)
+    "ace_cot_en":   "m-a-p/YuE-s1-7B-anneal-en-cot",
+    "ace_icl_en":   "m-a-p/YuE-s1-7B-anneal-en-icl",
+    "ace_cot_zh":   "m-a-p/YuE-s1-7B-anneal-zh-cot",
+    "ace_icl_zh":   "m-a-p/YuE-s1-7B-anneal-zh-icl",
+    "ace_cot_jpkr": "m-a-p/YuE-s1-7B-anneal-jp-kr-cot",
+    "ace_icl_jpkr": "m-a-p/YuE-s1-7B-anneal-jp-kr-icl",
+
     "stage2":    "m-a-p/YuE-s2-1B-general",
     "upsampler": "m-a-p/YuE-upsampler",
 }
@@ -358,6 +367,7 @@ def yue_subprocess_env() -> dict:
     return env
 
 _YUE_PYTHON: Optional[str] = None
+_PREFER_YUEGP: bool = True
 
 
 def python_has_torch(python: Path) -> bool:
@@ -374,6 +384,14 @@ def python_has_torch(python: Path) -> bool:
         return False
 
 
+def set_yuegp_preference(prefer_yuegp: bool) -> None:
+    """Set runtime preference for resolving inference Python (YuEGP-first vs YuE-first)."""
+    global _PREFER_YUEGP, _YUE_PYTHON
+    _PREFER_YUEGP = bool(prefer_yuegp)
+    # Reset cache so next resolution reflects the latest preference.
+    _YUE_PYTHON = None
+
+
 def resolve_yue_python() -> str:
     """Python interpreter with torch + YuE deps (not necessarily the UI's Python)."""
     global _YUE_PYTHON
@@ -388,18 +406,24 @@ def resolve_yue_python() -> str:
             return _YUE_PYTHON
 
     home = Path.home()
-    candidates = [
-        # Prefer YuEGP for quantized / lower-VRAM friendly inference.
+    yuegp_candidates = [
         home / "miniconda3/envs/yuegp/python.exe",
         home / "miniconda3/envs/yuegp/bin/python",
-        # Fallback to full-precision YuE.
+    ]
+    yue_candidates = [
         home / "miniconda3/envs/yue/python.exe",
         home / "miniconda3/envs/yue/bin/python",
         home / "anaconda3/envs/yue/python.exe",
         home / "anaconda3/envs/yue/bin/python",
-        # Last resort: current interpreter.
-        Path(sys.executable),
     ]
+
+    candidates = (
+        yuegp_candidates + yue_candidates
+        if _PREFER_YUEGP else
+        yue_candidates + yuegp_candidates
+    )
+    candidates.append(Path(sys.executable))
+
     for p in candidates:
         if python_has_torch(p):
             _YUE_PYTHON = str(p)

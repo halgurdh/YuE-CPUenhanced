@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from functools import lru_cache
 
 import gradio as gr
 
@@ -20,6 +21,7 @@ from yue_studio import (
     write_prompt_files, build_infer_command, RTX_3060_PROFILE,
     get_loop_config, MAX_SEGMENTS, MAX_DURATION_SECONDS,
     resolve_yue_python, python_has_torch, yue_subprocess_env, HF_HOME,
+    set_yuegp_preference,
 )
 
 # ─── UI Constants ────────────────────────────────────────────────────────────
@@ -70,11 +72,7 @@ STEM_CHOICES = [
 ]
 STEM_DEFAULT_MODEL = "htdemucs_6s"
 
-# Stage1 model size choices (1B vs 7B)
-STAGE1_SIZE_CHOICES = [
-    ("1B (default — faster, lower VRAM)", "1b"),
-    ("7B", "7b"),
-]
+# Stage1 model toggle is exposed as a checkbox in UI (default enabled)
 
 # Which YuE output track to feed into stem separation
 STEM_SOURCE_CHOICES = [
@@ -144,13 +142,22 @@ def build_genre_tag_string(
     return " ".join(result)
 
 
-_TQDM_PCT = re.compile(r"\b(\d{1,3})%\|\\")
+_TQDM_PCT = re.compile(r"(\d{1,3})%")
+_STAGE2_HINTS = ("stage2", "stage 2", "codec", "upsample", "stage 2 infer", "vocoder", "decoding")
+_STAGE1_HINTS = ("loading checkpoint shards", "stage1", "stage 1", "stage1 inference")
 
 
 # ─── Post-processing helpers ───────────────────────────────────────────────
 
+@lru_cache(maxsize=1)
 def _infer_env() -> dict:
     return yue_subprocess_env()
+
+
+def _first_match_rglob(output_dir: Path, pattern: str) -> Path | None:
+    for p in output_dir.rglob(pattern):
+        return p
+    return None
 
 
 def _pick_audio_for_stems(output_dir: Path, source: str = "auto") -> Path | None:
@@ -167,14 +174,14 @@ def _pick_audio_for_stems(output_dir: Path, source: str = "auto") -> Path | None
     }
     if source in by_source:
         for pattern in by_source[source]:
-            hits = sorted(output_dir.rglob(pattern))
-            if hits:
-                return hits[0]
+            hit = _first_match_rglob(output_dir, pattern)
+            if hit:
+                return hit
     for pattern in ("mixed_output.wav", "mixed*.wav", "vocal_output.wav",
                     "instrumental_output.wav", "*.wav"):
-        hits = sorted(output_dir.rglob(pattern))
-        if hits:
-            return hits[0]
+        hit = _first_match_rglob(output_dir, pattern)
+        if hit:
+            return hit
     return None
 
 
@@ -230,6 +237,15 @@ def run_stem_split_ui(
     return log, _best_stem_preview(stems)
 
 
+@lru_cache(maxsize=1)
+def _song_stitcher_fns():
+    from song_stitcher import (
+        SongPlan, build_plan_from_lyrics, describe_plan,
+        plan_total_bars, plan_total_calls, split_lyrics_into_sections,
+    )
+    return SongPlan, build_plan_from_lyrics, describe_plan, plan_total_bars, plan_total_calls, split_lyrics_into_sections
+
+
 def preview_stitch_plan(
     lyrics: str,
     structure: str,
@@ -238,10 +254,7 @@ def preview_stitch_plan(
 ) -> str:
     """Live summary of the section-stitch plan for the UI."""
     try:
-        from song_stitcher import (
-            SongPlan, build_plan_from_lyrics, describe_plan,
-            plan_total_bars, plan_total_calls, split_lyrics_into_sections,
-        )
+        SongPlan, build_plan_from_lyrics, describe_plan, plan_total_bars, plan_total_calls, split_lyrics_into_sections = _song_stitcher_fns()
     except ImportError:
         return "_song_stitcher not available — install pydub + ffmpeg._"
 
@@ -271,9 +284,7 @@ def preview_stitch_plan(
 
 
 def _build_stitch_plan(lyrics: str, structure: str, include_intro: bool, include_outro: bool):
-    from song_stitcher import (
-        SongPlan, build_plan_from_lyrics, split_lyrics_into_sections,
-    )
+    SongPlan, build_plan_from_lyrics, _, _, _, split_lyrics_into_sections = _song_stitcher_fns()
     if structure == "custom":
         sections = split_lyrics_into_sections(lyrics)
         if not sections:
@@ -348,22 +359,61 @@ def _stream_infer(
         env=_infer_env(),
     )
     stage = 1
+    fallback_pct = 0.05  # show immediate non-zero movement
+    progress(progress_base + progress_span * fallback_pct, desc=f"{desc} — Stage 1…")
+
     for line in iter(proc.stdout.readline, ""):
         log += line
         ll = line.lower()
+
+        # Stage detection with broader keywords so we don't get stuck at early %
+        if any(k in ll for k in _STAGE2_HINTS):
+            stage = 2
+            fallback_pct = max(fallback_pct, 0.70)
+            progress(
+                progress_base + progress_span * fallback_pct,
+                desc=f"{desc} — Stage 2…",
+            )
+            yield log, None, None
+            continue
+        elif any(k in ll for k in _STAGE1_HINTS):
+            stage = 1
+
         m = _TQDM_PCT.search(line)
         if m:
-            pct = int(m.group(1)) / 100
+            pct = min(100, max(0, int(m.group(1)))) / 100.0
             if stage == 1:
-                progress(progress_base + pct * progress_span * 0.6,
-                         desc=f"{desc} — Stage 1 {m.group(1)}%")
+                mapped = 0.05 + pct * 0.65   # 5% → 70%
+                fallback_pct = max(fallback_pct, mapped)
+                progress(
+                    progress_base + progress_span * mapped,
+                    desc=f"{desc} — Stage 1 {int(pct * 100)}%",
+                )
             else:
-                progress(progress_base + progress_span * 0.6 + pct * progress_span * 0.35,
-                         desc=f"{desc} — Stage 2 {m.group(1)}%")
-        elif "stage2" in ll or "stage 2" in ll:
-            stage = 2
-            progress(progress_base + progress_span * 0.6, desc=f"{desc} — Stage 2…")
+                mapped = 0.70 + pct * 0.28   # 70% → 98%
+                fallback_pct = max(fallback_pct, mapped)
+                progress(
+                    progress_base + progress_span * mapped,
+                    desc=f"{desc} — Stage 2 {int(pct * 100)}%",
+                )
+        else:
+            # Fallback heartbeat when no parseable percent appears.
+            if stage == 1:
+                # Keep forward movement visible during sparse logs
+                fallback_pct = min(0.70, fallback_pct + 0.02)
+                progress(
+                    progress_base + progress_span * fallback_pct,
+                    desc=f"{desc} — Stage 1…",
+                )
+            else:
+                fallback_pct = min(0.98, fallback_pct + 0.015)
+                progress(
+                    progress_base + progress_span * fallback_pct,
+                    desc=f"{desc} — Stage 2…",
+                )
+
         yield log, None, None
+
     proc.wait()
     yield log, proc.returncode, None
 
@@ -377,6 +427,7 @@ def run_generation_stream(
 
     # model
     lang,
+    use_ace_step,
     # quick options
     instrumental_only,
     no_drums,
@@ -392,11 +443,13 @@ def run_generation_stream(
     batch_size,
     max_tokens,
     rep_penalty,
+    fast_mode,
     seed_str,
     cuda_idx,
     # loop mode
     loop_enabled,
     loop_bars_in,
+    use_yuegp,
     # post-processing
     stem_split,
     stem_model,
@@ -432,14 +485,21 @@ def run_generation_stream(
         existing.append("no-drums")
     g = " ".join(existing)
 
+    # Fast mode: bias for faster Stage1 completion
+    if fast_mode:
+        max_tokens = min(int(max_tokens), 1500)
+        rep_penalty = max(float(rep_penalty), 1.2)
+
     g, segments, max_tokens, loop_note = _apply_loop_mode(
         g, loop_enabled, loop_bars_in, int(segments), int(max_tokens),
     )
 
+    set_yuegp_preference(bool(use_yuegp))
     use_dual = (icl_mode == "dual" and vocal_file and instrumental_file)
     use_single = (icl_mode == "single" and audio_file)
-    stage1_key = f"icl_{lang}" if (use_dual or use_single) else f"cot_{lang}"
-    stage1_model = MODELS.get(stage1_key, MODELS["cot_en"])
+    task_key = f"icl_{lang}" if (use_dual or use_single) else f"cot_{lang}"
+    stage1_key = f"ace_{task_key}" if use_ace_step else task_key
+    stage1_model = MODELS.get(stage1_key, MODELS.get(task_key, MODELS["cot_en"]))
     seed = int(seed_str) if str(seed_str).strip().isdigit() else None
 
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -476,7 +536,7 @@ def run_generation_stream(
     if loop_note:
         log += loop_note
     log += "─" * 60 + "\n"
-    progress(0, desc="Starting…")
+    progress(0, desc="Preparing run…")
     yield log, None, None
 
     try:
@@ -511,10 +571,11 @@ def run_generation_stream(
             rescale=True,
         )
         log += f"▶ {' '.join(cmd)}\n" + "─" * 60 + "\n"
+        progress(0.03, desc="Launching infer process…")
         yield log, None, None
 
         rc = 1
-        for update in _stream_infer(cmd, log, progress, 0.05, 0.85, "Generating"):
+        for update in _stream_infer(cmd, log, progress, 0.05, 0.88, "Generating"):
             log = update[0]
             if update[1] is not None and isinstance(update[1], int):
                 rc = update[1]
@@ -527,9 +588,8 @@ def run_generation_stream(
             yield log + f"✗ Generation failed (exit {rc})\n", None, None
             return
 
-        audio_files = sorted(
-            list(output_dir.rglob("*.wav")) + list(output_dir.rglob("*.mp3"))
-        )
+        audio_files = sorted(output_dir.rglob("*.wav"))
+        audio_files.extend(sorted(output_dir.rglob("*.mp3")))
         log += f"✓ Generation done! {len(audio_files)} file(s)\n"
         for af in audio_files:
             log += f"  → {af.name}\n"
@@ -537,7 +597,7 @@ def run_generation_stream(
 
         # ── Post-processing: Stem Split ───────────────────────────────
         if stem_split and audio_out:
-            progress(0.95, desc="Splitting stems…")
+            progress(0.94, desc="Splitting stems…")
             log += "\n" + "─" * 60 + "\n"
             log, stems_audio = run_stem_split_ui(
                 output_dir, stem_model, log, source=stem_source,
@@ -551,13 +611,13 @@ def run_generation_stream(
                 audio_out = str(stitched)
             else:
                 from song_stitcher import stitch_sections
-                section_wavs = sorted(list(output_dir.rglob("*.wav")))
-
-                # Filter out stems previews and already-stitched output.
-                section_wavs = [
-                    w for w in section_wavs
-                    if w.name.lower() != "stitched.wav" and "/stems/" not in str(w).lower()
-                ]
+                section_wavs = []
+                for w in output_dir.rglob("*.wav"):
+                    wn = w.name.lower()
+                    wp = str(w).lower()
+                    if wn == "stitched.wav" or "/stems/" in wp:
+                        continue
+                    section_wavs.append(w)
 
                 if not section_wavs:
                     log += "\n[red]✗ Stitch-only failed: no per-section WAVs found under output dir.[/red]\n"
@@ -566,7 +626,7 @@ def run_generation_stream(
                     return
 
                 log += "\n[green]▶ Stitch-only[/green] using existing section WAVs…\n"
-                progress(0.97, desc="Stitching existing sections…")
+                progress(0.98, desc="Stitching existing sections…")
 
                 # Best-effort order: by call folder name then filename.
                 section_wavs.sort(key=lambda p: (str(p.parent), p.name))
@@ -697,7 +757,7 @@ def build_ui():
                         p_start = gr.Number(label="Start (s)", value=0, precision=0)
                         p_end = gr.Number(label="End (s)", value=30, precision=0)
 
-with gr.Column(scale=2):
+            with gr.Column(scale=2):
                 with gr.Group():
                     gr.Markdown("### 🌐 Language Model")
                     lang_model = gr.Radio(
@@ -707,18 +767,17 @@ with gr.Column(scale=2):
 
                 with gr.Accordion("⚙ Generation Settings (RTX 3060 8GB defaults)", open=True):
                     gr.Markdown("⚡ Default for 8GB VRAM: **Fast + stable**. Use YuE full-precision (GPU) with 1 segment (~30s) to avoid retries/OOM. For longer audio, switch to YuEGP (launch_yuegp.py) instead.")
-# Model size selector (1B vs 7B)
-                    stage1_size = gr.Radio(
-                        choices=STAGE1_SIZE_CHOICES,
-                        value="1b",
-                        label="Stage1 Model Size",
+                    use_ace_step_cb = gr.Checkbox(
+                        label="Use ACE-Step 1.5",
+                        value=True,
                     )
                     # Fast/stable defaults
-                    seg_sl = gr.Slider(1, 4, value=RTX_3060_PROFILE["run_n_segments"], step=1, label="Segments (1≈30s, 2≈1min) — keep 1 on 8GB")
+                    seg_sl = gr.Slider(1, 4, value=1, step=1, label="Segments (1≈30s, 2≈1min) — keep 1 on 8GB")
                     batch_sl = gr.Slider(1, 4, value=RTX_3060_PROFILE["stage2_batch_size"], step=1, label="Batch size (keep ≤2 on 8GB)")
-                    tok_sl = gr.Slider(1000, 6000, value=RTX_3060_PROFILE["max_new_tokens"], step=500, label="Max tokens")
+                    tok_sl = gr.Slider(1000, 6000, value=2000, step=250, label="Max tokens")
                     # Slightly higher repetition penalty reduces loops/repeats and often stabilizes decoding
-                    rep_sl = gr.Slider(1.0, 1.6, value=1.12, step=0.02, label="Repetition penalty")
+                    rep_sl = gr.Slider(1.0, 1.6, value=1.2, step=0.02, label="Repetition penalty")
+                    fast_mode_cb = gr.Checkbox(label="⚡ Fast Mode (reduce Stage 1 time)", value=True)
                     seed_box = gr.Textbox(label="Seed (blank = random)", value="", max_lines=1)
                     # Prefer cuda:0 by default; UI previously used 1 which can be wrong on single-GPU setups
                     cuda_sl = gr.Slider(0, 7, value=0, step=1, label="CUDA device", interactive=True)
@@ -728,7 +787,8 @@ with gr.Column(scale=2):
                 with gr.Accordion("🔁 Loop Mode — pre-generation", open=False):
                     gr.Markdown("_Auto-detect bar count from genre and raise token budget. Clamped to 8GB VRAM max (1 segment ≈ 30s ≈ 12 bars)._")
                     with gr.Row():
-                        loop_cb = gr.Checkbox(label="Enable Loop Mode", value=False)
+                        loop_cb = gr.Checkbox(label="Enable Loop Mode", value=True)
+                        use_yuegp_cb = gr.Checkbox(label="Use YuEGP", value=True)
 
                         loop_bars_in = gr.Number(label="Bars/section (0 = auto-detect)", value=0, precision=0)
 
@@ -767,6 +827,7 @@ with gr.Column(scale=2):
                                 outro_cb = gr.Checkbox(label="Include outro", value=True, interactive=True)
 
                 gr.Markdown("### 🚀 Generate")
+                gr.Markdown("_Use YuEGP is enabled by default for quantized / lower-VRAM-friendly inference env preference._")
                 with gr.Row():
                     gen_btn = gr.Button("Generate Track ▶", variant="primary")
                     stop_btn = gr.Button("■ Stop", variant="stop")
@@ -859,11 +920,11 @@ with gr.Column(scale=2):
             run_generation_stream,
             inputs=[
                 preset_dd, genre_box, lyrics_box,
-                lang_model,
+                lang_model, use_ace_step_cb,
                 instrumental_cb, no_drums_cb,
                 icl_mode, audio_ref, vocal_ref, inst_ref, p_start, p_end,
-                seg_sl, batch_sl, tok_sl, rep_sl, seed_box, cuda_sl,
-                loop_cb, loop_bars_in,
+                seg_sl, batch_sl, tok_sl, rep_sl, fast_mode_cb, seed_box, cuda_sl,
+                loop_cb, loop_bars_in, use_yuegp_cb,
                 stem_cb, stem_dd, stem_src_dd,
                 stitch_cb, stitch_only_no_regen_cb, struct_dd, crossfade_sl, intro_cb, outro_cb,
             ],

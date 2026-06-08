@@ -1,15 +1,11 @@
-# TODO — Section Stitch UI enable/disable bug
+# TODO
 
-
-- [x] Update `yue_ui.py` so the Section Stitch enable logic consistently controls:
-
-  - `struct_dd`, `crossfade_sl`, `intro_cb`, `outro_cb`
-  - `stitch_only_no_regen_cb`
-- [x] Ensure both:
-
-  - the runtime `stitch_cb.change(...)` handler
-  - the initial `demo.load(...)` handler
-  apply the exact same enable/disable wiring.
-- [x] Run a quick syntax check (python -m py_compile) for `yue_ui.py`.
-
-
+- [ ] Optimize `yue_ui.py` for speed:
+  - [ ] Add caching for expensive runtime resolution/checks (`resolve_yue_python` / torch-availability gate in UI flow)
+  - [ ] Reduce recursive filesystem scans (`rglob`) by preferring deterministic candidates and early-exit search
+  - [ ] Improve log streaming performance to avoid repeated large-string concatenation hot path
+  - [ ] Cache `song_stitcher` imports/helpers used by reactive preview callbacks
+  - [ ] Narrow stitch-only section WAV discovery/sorting to avoid broad recursive work
+  - [ ] Apply small hot-path micro-optimizations (keyword constants, less repeated split/join work)
+- [ ] Run syntax validation (`python -m py_compile yue_ui.py yue_studio.py`)
+- [ ] Mark completed items in this TODO

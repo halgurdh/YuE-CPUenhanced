@@ -25,8 +25,18 @@ parser.add_argument("--segments", type=int, default=2,
                          "Higher values risk OOM on 8GB VRAM.")
 args = parser.parse_args()
 
+# Map segments to profile (higher segments = more VRAM needed)
+# Profile 4 = 12GB VRAM, Profile 3 = 8GB, Profile 2 = 6GB, Profile 1 = 4GB
+segment_to_profile = {
+    1: "2",  # 1 segment ~30s = 4GB
+    2: "3",  # 2 segments ~1min = 6GB (safe for 8GB)
+    3: "4",   # 3 segments ~1.5min = 8GB 
+    4: "4",   # 4 segments ~2min = 12GB
+}
+profile = segment_to_profile.get(args.segments, "3")
+
 result = subprocess.run(
-    [PYTHON, SCRIPT, "--profile", "4", "--sdpa", "--max_segments", str(args.segments)],
+    [PYTHON, SCRIPT, "--profile", profile, "--sdpa", "--segments", str(args.segments)],
     cwd=str(INFERENCE_DIR),
     env=yue_subprocess_env(),
 )
